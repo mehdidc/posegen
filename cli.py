@@ -9,6 +9,8 @@ from PIL import Image
 import skvideo.io
 import torchvision
 import json
+from collections import defaultdict
+from joblib import dump
 
 class Args(object):
     pass
@@ -30,7 +32,7 @@ class ImageList(torch.utils.data.Dataset):
         return len(self.images)
 
 
-def predict_pose(video_path):
+def predict_pose(video_path, *, out="out", device="cuda"):
     args = Args()
     args.checkpoint = None
     args.basenet = None
@@ -47,10 +49,11 @@ def predict_pose(video_path):
     args.profile_decoder = False
     args.instance_threshold = 0.0
     model, _ = nets.factory(args)
-    args.device = "cuda"
+    args.device = device
     args.show = False
     args.figure_width = 10
     args.dpi_factor = 1.0
+    
     model = model.to(args.device)
     processors = decoder.factory(args, model)
 
@@ -59,14 +62,15 @@ def predict_pose(video_path):
     data_loader = torch.utils.data.DataLoader(
         dataset, batch_size=1, shuffle=False, pin_memory=True, num_workers=2
     )
-
-    keypoint_painter = show.KeypointPainter(show_box=False)
+    show.KeypointPainter(show_box=False)
     skeleton_painter = show.KeypointPainter(
         show_box=False, color_connections=True, markersize=1, linewidth=6
     )
     i = 0
     name = os.path.basename(video_path)
-    dest = os.path.join("out", name)
+    class_name = os.path.basename(os.path.dirname(video_path))
+    dest = os.path.join(out, class_name)
+    frames = []
     if not os.path.exists(dest):
         os.makedirs(dest)
     for image_i, (image_paths, image_tensors, processed_images_cpu) in enumerate(data_loader):
@@ -74,50 +78,33 @@ def predict_pose(video_path):
         processed_images = processed_images_cpu.to(args.device, non_blocking=True)
         fields_batch = processors[0].fields(processed_images)
         for image_path, image, processed_image_cpu, fields in zip(image_paths, images, processed_images_cpu, fields_batch):
-            output_path = f"{dest}/{i:05d}"
-            i += 1
             processors[0].set_cpu_image(image, processed_image_cpu)
             for processor in processors:
                 keypoint_sets, scores = processor.keypoint_sets(fields)
-                with open(output_path + ".pifpaf.json", "w") as f:
-                    json.dump(
-                        [
-                            {
-                                "keypoints": np.around(kps, 1).reshape(-1).tolist(),
-                                "bbox": [
-                                    np.min(kps[:, 0]),
-                                    np.min(kps[:, 1]),
-                                    np.max(kps[:, 0]),
-                                    np.max(kps[:, 1]),
-                                ],
-                            }
-                            for kps in keypoint_sets
-                        ],
-                        f,
-                    )
-                with show.image_canvas(
-                    image,
-                    output_path + ".keypoints.png",
-                    show=args.show,
-                    fig_width=args.figure_width,
-                    dpi_factor=args.dpi_factor,
-                ) as ax:
-                    # show.white_screen(ax, alpha=0.5)
-                    keypoint_painter.keypoints(ax, keypoint_sets)
-                with show.image_canvas(
-                    image,
-                    output_path + ".skeleton.png",
-                    show=args.show,
-                    fig_width=args.figure_width,
-                    dpi_factor=args.dpi_factor,
-                ) as ax:
-                    skeleton_painter.keypoints(ax, keypoint_sets, scores=scores)
-
+                frames.append((keypoint_sets, scores))
+                # with show.image_canvas(
+                    # image,
+                    # output_path + ".keypoints.png",
+                    # show=args.show,
+                    # fig_width=args.figure_width,
+                    # dpi_factor=args.dpi_factor,
+                # ) as ax:
+                    # # show.white_screen(ax, alpha=0.5)
+                    # keypoint_painter.keypoints(ax, keypoint_sets)
+                # with show.image_canvas(
+                    # image,
+                    # output_path + ".skeleton.png",
+                    # show=args.show,
+                    # fig_width=args.figure_width,
+                    # dpi_factor=args.dpi_factor,
+                # ) as ax:
+                    # skeleton_painter.keypoints(ax, keypoint_sets, scores=scores)
+    out = os.path.join(dest, name+".pkl")
+    dump(frames, out)
 
 def predict_pose_videos(pattern):
     for video_path in glob(pattern):
         predict_pose(video_path)
-
 
 if __name__ == "__main__":
     run([predict_pose, predict_pose_videos])
