@@ -1,3 +1,5 @@
+import os
+from glob import glob
 import numpy as np
 from clize import run
 from openpifpaf import datasets, decoder, show, transforms
@@ -45,7 +47,7 @@ def predict_pose(video_path):
     args.profile_decoder = False
     args.instance_threshold = 0.0
     model, _ = nets.factory(args)
-    args.device = "cpu"
+    args.device = "cuda"
     args.show = False
     args.figure_width = 10
     args.dpi_factor = 1.0
@@ -63,12 +65,16 @@ def predict_pose(video_path):
         show_box=False, color_connections=True, markersize=1, linewidth=6
     )
     i = 0
+    name = os.path.basename(video_path)
+    dest = os.path.join("out", name)
+    if not os.path.exists(dest):
+        os.makedirs(dest)
     for image_i, (image_paths, image_tensors, processed_images_cpu) in enumerate(data_loader):
         images = image_tensors.permute(0, 2, 3, 1)
         processed_images = processed_images_cpu.to(args.device, non_blocking=True)
         fields_batch = processors[0].fields(processed_images)
         for image_path, image, processed_image_cpu, fields in zip(image_paths, images, processed_images_cpu, fields_batch):
-            output_path = f"out/{i:05d}"
+            output_path = f"{dest}/{i:05d}"
             i += 1
             processors[0].set_cpu_image(image, processed_image_cpu)
             for processor in processors:
@@ -108,5 +114,10 @@ def predict_pose(video_path):
                     skeleton_painter.keypoints(ax, keypoint_sets, scores=scores)
 
 
+def predict_pose_videos(pattern):
+    for video_path in glob(pattern):
+        predict_pose(video_path)
+
+
 if __name__ == "__main__":
-    run([predict_pose])
+    run([predict_pose, predict_pose_videos])
