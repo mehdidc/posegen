@@ -208,7 +208,7 @@ class Model(nn.Module):
         return o
 
 
-def train(folder, device="cpu"):
+def train(folder, device="cpu", epochs=1000):
     dataset = KeypointDataset(folder, max_len=50)
     dataloader = torch.utils.data.DataLoader(
         dataset, batch_size=32, shuffle=True)
@@ -216,7 +216,8 @@ def train(folder, device="cpu"):
     model = model.to(device)
     opt = Adam(model.parameters(), lr=1e-3)
     n_iter = 0
-    for epoch in range(100):
+    keypoint_painter = show.KeypointPainter(show_box=True)
+    for epoch in range(epochs):
         for X, M, Y in dataloader:
             X = X.to(device)
             X = X.view(X.size(0), X.size(1), -1)
@@ -232,6 +233,16 @@ def train(folder, device="cpu"):
             loss.backward()
             opt.step()
             print(n_iter, loss.item())
+            if n_iter % 100 == 0:
+                P = P.detach().cpu().numpy()
+                P = P.reshape((P.shape[0], P.shape[1], 17, 3))
+                P = np.clip(P, 0, 1)
+                P = P * 500
+                p = P[0]
+                for i in range(len(p)):
+                    image = np.zeros((500, 500, 3))
+                    with show.image_canvas(image, f"log/{i:05d}.png") as ax:
+                        keypoint_painter.keypoints(ax, p[i:i+1])
             n_iter += 1
 
 
