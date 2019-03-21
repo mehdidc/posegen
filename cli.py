@@ -202,15 +202,15 @@ class Model(nn.Module):
         self.hidden_size = hidden_size
         self.output_size = output_size
     
-    def forward(self, x):
+    def forward(self, x, h=None):
         b = x.shape[0]
         t = x.shape[1]
-        h, _ = self.rnn(x)
-        h = h.contiguous()
-        h = h.view(b*t, self.hidden_size)
-        o = self.out(h)
+        o, h = self.rnn(x, h)
+        o = o.contiguous()
+        o = o.view(b*t, self.hidden_size)
+        o = self.out(o)
         o = o.view(b, t, self.output_size)
-        return o
+        return o, h
 
 def mdn_loss_function(output, target, nb_components=1, nb_outputs=17*3):
     B = output.size(0)
@@ -227,7 +227,7 @@ def mdn_loss_function(output, target, nb_components=1, nb_outputs=17*3):
     out_sigma = torch.exp(out_sigma)
     
     out_pi = o[:, :, :, 2*F:2*F+1]
-    out_pi = nn.Softmax(dim=3)(out_pi)
+    out_pi = nn.Softmax(dim=2)(out_pi)
 
     result = Normal(loc=out_mu, scale=out_sigma)
     target = target.view(B, T, 1, -1)
@@ -249,7 +249,7 @@ def train(*, folder="out", device="cpu", epochs=1000):
         batch_size=32, 
         shuffle=True
     )
-    nb_components = 1
+    nb_components = 20
     nb_keypoints = 17*3
     model = Model(
         input_size=nb_keypoints,
@@ -271,7 +271,7 @@ def train(*, folder="out", device="cpu", epochs=1000):
 
             I = X[:, 0:-1, :]
             T = X[:, 1:, :]
-            O = model(I)
+            O, _ = model(I)
             opt.zero_grad()
             mdn_loss = mdn_loss_function(
                 O, 
@@ -285,26 +285,55 @@ def train(*, folder="out", device="cpu", epochs=1000):
             opt.step()
             print(n_iter, loss.item())
             if n_iter % 100 == 0:
+                sig_mult = 1/10
+                #Pred
                 idx = 0
                 o = O[idx]
                 o = o.detach().cpu()
                 o = o.reshape((o.shape[0], nb_components, (2*nb_keypoints + 1)))
                 mu = o[:, :, 0:nb_keypoints]
                 sig = o[:, :, nb_keypoints:nb_keypoints*2]
-                sig = torch.exp(sig)
+                sig = torch.exp(sig) * sig_mult
                 pi = o[:, :, nb_keypoints*2:nb_keypoints*2+1]
                 pi = nn.Softmax(dim=1)(pi)
-                #o = (torch.normal(mu, sig) * pi).sum(dim=1)
-                o = (mu * pi).sum(dim=1)
+                o = (torch.normal(mu, sig) * pi).sum(dim=1)
+                #o = (mu * pi).sum(dim=1)
                 o = o.numpy()
                 o = np.clip(o, 0, 1)
                 o = o * 500
                 o = o.reshape((o.shape[0], 17, 3))
                 for i in range(len(o)):
                     image = np.zeros((500, 500, 3))
-                    with show.image_canvas(image, f"log/{i:05d}.png") as ax:
+                    with show.image_canvas(image, f"log/pred/{i:05d}.png") as ax:
+                        keypoint_painter.keypoints(ax, o[i:i+1])
+                #Gen
+                nb_steps = 50
+                O = torch.zeros(1, nb_steps, nb_keypoints)
+                o = torch.zeros(1, 1, nb_keypoints)
+                o = o.to(device)
+                x = o
+                for t in range(nb_steps):
+                    o, h = model(x)
+                    o = o.reshape((o.shape[0], nb_components, (2*nb_keypoints + 1)))
+                    mu = o[:, :, 0:nb_keypoints]
+                    sig = o[:, :, nb_keypoints:nb_keypoints*2]
+                    sig = torch.exp(sig) * sig_mult
+                    pi = o[:, :, nb_keypoints*2:nb_keypoints*2+1]
+                    pi = nn.Softmax(dim=1)(pi)
+                    o = (torch.normal(mu, sig) * pi).sum(dim=1)
+                    o = o.view(1, 1, nb_keypoints)
+                    x = o.detach()
+                    O[:, t] = x.cpu()
+                o = O.cpu().numpy()
+                o = np.clip(o, 0, 1)
+                o = o * 500
+                o = o.reshape((nb_steps, 17, 3))
+                for i in range(len(o)):
+                    image = np.zeros((500, 500, 3))
+                    with show.image_canvas(image, f"log/gen/{i:05d}.png") as ax:
                         keypoint_painter.keypoints(ax, o[i:i+1])
             n_iter += 1
+
 
 
 def viz(folder):
