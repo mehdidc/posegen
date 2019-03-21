@@ -15,6 +15,7 @@ from joblib import dump, load
 from scoreml.detection import Thing, Box
 from torch.optim import Adam
 from iou_tracker import iou_tracker
+from torch.distributions import Normal
 
 
 class Args(object):
@@ -117,14 +118,15 @@ def predict_pose_videos(pattern):
 
 class KeypointDataset:
 
-    def __init__(self, folder, max_len=100):
+    def __init__(self, folder, max_len=100, max_examples=None):
         self.folder = folder
         self.videos = glob(os.path.join(folder, "**", "*.pkl"))
-        self.videos = self.videos[0:100]
         self.tracks = []
         self.classes = []
         self.max_len = max_len
+        self.max_examples = max_examples
         self._prepare()
+        self.classes_unique =  sorted(list(set(self.classes)))
     
     def _prepare(self):
         for vid in self.videos:
@@ -159,7 +161,8 @@ class KeypointDataset:
                 track = sorted(track, key=lambda obj:obj.frame_id)
                 self.tracks.append(track)
                 self.classes.append(class_name)
-        self.classes_unique =  sorted(list(set(self.classes)))
+                if self.max_examples and len(self.tracks) == self.max_examples:
+                    return
 
 
     def __getitem__(self, idx):
@@ -170,16 +173,19 @@ class KeypointDataset:
             kps.append(obj.kp)
         kps = np.array(kps)
         L = kps.shape[0]
-        z = np.zeros((max(self.max_len - kps.shape[0], 0), kps.shape[1], kps.shape[2]))
-        kps = np.concatenate((kps, z), axis=0)
+        first = np.zeros((1, kps.shape[1], kps.shape[2]))
+        last = np.zeros((max(self.max_len - kps.shape[0] - 1, 0), kps.shape[1], kps.shape[2]))
+        kps = np.concatenate((first, kps, last), axis=0)
         kps = kps[0:self.max_len]
         kps = torch.from_numpy(kps).float()
         mask = torch.zeros_like(kps).float()
-        mask[0:L] = 1
+        mask[0:L+1] = 1
+        kps[L+1:] = kps[L:L+1]
         return kps, mask, self.classes_unique.index(class_)
     
     def __len__(self):
         return len(self.tracks)
+
 
 class Model(nn.Module):
 
@@ -199,7 +205,6 @@ class Model(nn.Module):
     def forward(self, x):
         b = x.shape[0]
         t = x.shape[1]
-
         h, _ = self.rnn(x)
         h = h.contiguous()
         h = h.view(b*t, self.hidden_size)
@@ -207,42 +212,98 @@ class Model(nn.Module):
         o = o.view(b, t, self.output_size)
         return o
 
+def mdn_loss_function(output, target, nb_components=1, nb_outputs=17*3):
+    B = output.size(0)
+    T = output.size(1)
+    M = nb_components
+    F = nb_outputs
+    EPSILON = 1e-7
+    o = output
+    t = target
+    o = o.view(B, T, M, F * 2 + 1)
+    out_mu = o[:, :, :, 0:F]
 
-def train(folder, device="cpu", epochs=1000):
-    dataset = KeypointDataset(folder, max_len=50)
+    out_sigma = o[:, :, :, F:2*F]
+    out_sigma = torch.exp(out_sigma)
+    
+    out_pi = o[:, :, :, 2*F:2*F+1]
+    out_pi = nn.Softmax(dim=3)(out_pi)
+
+    result = Normal(loc=out_mu, scale=out_sigma)
+    target = target.view(B, T, 1, -1)
+    result = torch.exp(result.log_prob(target))
+    result = torch.sum(result * out_pi, dim=2)
+    result = -torch.log(EPSILON + result)
+    return result
+
+
+def train(*, folder="out", device="cpu", epochs=1000):
+    dataset = KeypointDataset(
+        folder, 
+        max_len=50,
+        max_examples=10,
+    )
+    print(len(dataset))
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=32, shuffle=True)
-    model = Model()
+        dataset, 
+        batch_size=32, 
+        shuffle=True
+    )
+    nb_components = 1
+    nb_keypoints = 17*3
+    model = Model(
+        input_size=nb_keypoints,
+        hidden_size=128,
+        output_size=nb_components*(2 * nb_keypoints + 1),
+    )
     model = model.to(device)
     opt = Adam(model.parameters(), lr=1e-3)
     n_iter = 0
-    keypoint_painter = show.KeypointPainter(show_box=True)
+    keypoint_painter = show.KeypointPainter(show_box=False)
     for epoch in range(epochs):
         for X, M, Y in dataloader:
             X = X.to(device)
             X = X.view(X.size(0), X.size(1), -1)
 
             M = M.view(M.size(0), M.size(1), -1)
+            M = M[:, 0:-1, :]
             M = M.to(device)
 
             I = X[:, 0:-1, :]
-            O = X[:, 1:, :]
-            P = model(I)
+            T = X[:, 1:, :]
+            O = model(I)
             opt.zero_grad()
-            loss = (((P - O) ** 2) * M[:, 1:]).mean()
+            mdn_loss = mdn_loss_function(
+                O, 
+                T, 
+                nb_components=nb_components, 
+                nb_outputs=nb_keypoints
+            )
+            #loss = (mdn_loss * M).mean()
+            loss = mdn_loss.mean()
             loss.backward()
             opt.step()
             print(n_iter, loss.item())
             if n_iter % 100 == 0:
-                P = P.detach().cpu().numpy()
-                P = P.reshape((P.shape[0], P.shape[1], 17, 3))
-                P = np.clip(P, 0, 1)
-                P = P * 500
-                p = P[0]
-                for i in range(len(p)):
+                idx = 0
+                o = O[idx]
+                o = o.detach().cpu()
+                o = o.reshape((o.shape[0], nb_components, (2*nb_keypoints + 1)))
+                mu = o[:, :, 0:nb_keypoints]
+                sig = o[:, :, nb_keypoints:nb_keypoints*2]
+                sig = torch.exp(sig)
+                pi = o[:, :, nb_keypoints*2:nb_keypoints*2+1]
+                pi = nn.Softmax(dim=1)(pi)
+                #o = (torch.normal(mu, sig) * pi).sum(dim=1)
+                o = (mu * pi).sum(dim=1)
+                o = o.numpy()
+                o = np.clip(o, 0, 1)
+                o = o * 500
+                o = o.reshape((o.shape[0], 17, 3))
+                for i in range(len(o)):
                     image = np.zeros((500, 500, 3))
                     with show.image_canvas(image, f"log/{i:05d}.png") as ax:
-                        keypoint_painter.keypoints(ax, p[i:i+1])
+                        keypoint_painter.keypoints(ax, o[i:i+1])
             n_iter += 1
 
 
@@ -253,7 +314,7 @@ def viz(folder):
             break
     X, Y = dataset[i]
     X = X.numpy() * 500
-    keypoint_painter = show.KeypointPainter(show_box=True)
+    keypoint_painter = show.KeypointPainter(show_box=False)
     for i in range(len(X)):
         image = np.zeros((500, 500, 3))
         with show.image_canvas(image, f"{i:05d}.png") as ax:
